@@ -2,7 +2,7 @@
  * This file is originally part of ZuluSCSI adopted for BlueSCSI
  *
  * ZuluSCSI™ - Copyright (c) 2023-2025 Rabbit Hole Computing™
- * Copyright (c) 2023-2025 Eric Helgeson
+ * Copyright (c) 2023-2026 Eric Helgeson <eric@bluescsi.com>
  * 
  * This file is licensed under the GPL version 3 or any later version.  
  * 
@@ -36,7 +36,7 @@
 // SCSI system and device settings
 BlueSCSISettings g_scsi_settings;
 
-const char *systemPresetName[] = {"", "Mac", "MacPlus", "MPC3000", "MegaSTE", "X68000", "X68000-SCSI", "X68000-SASI", "NeXT", "Generic"};
+const char *systemPresetName[] = {"", "Mac", "MacPlus", "MPC3000", "MegaSTE", "X68000", "X68000-SCSI", "X68000-SASI", "NeXT", "PC-9801-55", "Generic"};
 const char *devicePresetName[] = {"", "ST32430N"};
 
 // must be in the same order as bluescsi_speed_grade_t in BlueSCSI_settings.h
@@ -51,6 +51,15 @@ const char * const speed_grade_strings[] =
     "B",
     "C",
     "WifiRM2"
+};
+
+// must be in the same order as bluescsi_wifi_security_t in BlueSCSI_settings.h
+const char * const wifi_security_strings[] =
+{
+    "WPA2",
+    "WPA2AES",
+    "WPA3",
+    "WPA3WPA2"
 };
 
 // Helper function for case-insensitive string compare
@@ -113,8 +122,8 @@ const char **BlueSCSISettings::deviceInitST32430N(uint8_t scsiId)
 
 void BlueSCSISettings::setDefaultDriveInfo(uint8_t scsiId, const char *presetName, S2S_CFG_TYPE type)
 {
-    char section[6] = "SCSI0";
-    section[4] += scsiId;
+    char section[8];
+    snprintf(section, sizeof(section), "SCSI%d", (int)scsiId);
 
     scsi_device_settings_t &cfgDev = m_dev[scsiId];
     scsi_device_settings_t &cfgDefault = m_dev[SCSI_SETTINGS_SYS_IDX];
@@ -543,6 +552,14 @@ scsi_system_settings_t *BlueSCSISettings::initSystem(const char *presetName)
         cfgSys.enableParity = false;
         cfgSys.maxSyncSpeed = 5;
     }
+    else if (strequals(systemPresetName[SYS_PRESET_PC_9801_55], presetName))
+    {
+        m_sysPreset = SYS_PRESET_PC_9801_55;
+        cfgSys.quirks = S2S_CFG_QUIRKS_PC98_55;
+        cfgSys.enableSCSI2 = false;
+        cfgDev.sectorsPerTrack = 25;
+        cfgDev.headsPerCylinder = 8;
+    }
     else if (strequals(systemPresetName[SYS_PRESET_NeXT], presetName))
     {
         m_sysPreset = SYS_PRESET_NeXT;
@@ -566,6 +583,13 @@ scsi_system_settings_t *BlueSCSISettings::initSystem(const char *presetName)
     memset(cfgDev.prodId, 0, sizeof(cfgDev.prodId));
     memset(cfgDev.revision, 0, sizeof(cfgDev.revision));
     memset(cfgDev.serial, 0, sizeof(cfgDev.serial));
+
+    if (m_sysPreset == SYS_PRESET_PC_9801_55)
+    {
+        // The controller requires that Vendor starts with "NEC"; the
+        // remaining characters are ignored by the host
+        strncpy(cfgDev.vendor, "NECBLUE", sizeof(cfgDev.vendor));
+    }
 
     // Snapshot defaults before INI reads for diff logging
     scsi_system_settings_t sysSnapshot = cfgSys;
@@ -628,8 +652,8 @@ scsi_device_settings_t* BlueSCSISettings::initDevice(uint8_t scsiId, S2S_CFG_TYP
 {
     scsi_device_settings_t& cfg = m_dev[scsiId];
     char presetName[32] = {};
-    char section[6] = "SCSI0";
-    section[4] = '0' + scsiId;
+    char section[8];
+    snprintf(section, sizeof(section), "SCSI%d", (int)scsiId);
 
 #ifdef BLUESCSI_HARDWARE_CONFIG
     const char *hwDevicePresetName = g_scsi_settings.getDevicePresetName(scsiId);
@@ -742,6 +766,20 @@ bluescsi_speed_grade_t BlueSCSISettings::stringToSpeedGrade(const char *speed_gr
     }
 
     return grade;
+}
+
+bluescsi_wifi_security_t BlueSCSISettings::stringToWifiSecurity(const char *wifi_security_target)
+{
+    for (uint8_t i = 0; i < sizeof(wifi_security_strings)/sizeof(wifi_security_strings[0]); i++)
+    {
+        if (strequals(wifi_security_target, wifi_security_strings[i]))
+        {
+            return (bluescsi_wifi_security_t)i;
+        }
+    }
+
+    logmsg("Setting \"", wifi_security_target, "\" does not match any known Wi-Fi security mode, using WPA2");
+    return WIFI_SECURITY_WPA2;
 }
 
 const char *BlueSCSISettings::getSpeedGradeString()

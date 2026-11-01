@@ -1,6 +1,6 @@
 /*
  *  BlueSCSI v2
- *  Copyright (c) 2023-2025 Eric Helgeson, Androda, and contributors.
+ *  Copyright (c) 2023-2026 Eric Helgeson, Androda, and contributors.
  *
  *  This project is based on ZuluSCSI, BlueSCSI v1, and SCSI2SD:
  *
@@ -62,6 +62,7 @@
 #include "BlueSCSI_log_trace.h"
 #include "BlueSCSI_settings.h"
 #include "BlueSCSI_disk.h"
+#include "BlueSCSI_audio.h"
 #include "BlueSCSI_initiator.h"
 #include "BlueSCSI_msc_initiator.h"
 #include "BlueSCSI_msc.h"
@@ -108,7 +109,14 @@ void save_logfile(bool always = false)
   {
     // When debug is off, save log at most every LOG_SAVE_INTERVAL_MS
     // When debug is on, save after every SCSI command.
-    if (always || g_log_debug || (LOG_SAVE_INTERVAL_MS > 0 && (uint32_t)(platform_millis() - prev_log_save) > LOG_SAVE_INTERVAL_MS))
+    bool every_command = g_log_debug;
+#ifdef ENABLE_AUDIO_OUTPUT
+    // An SD write can stall for 100-500 ms and CD audio buffers 46 ms,
+    // so batch the saves while a track plays.
+    if (audio_is_active()) every_command = false;
+#endif
+    bool buffer_filling = (loglen - prev_log_pos) > LOGBUFSIZE / 2;
+    if (always || every_command || buffer_filling || (LOG_SAVE_INTERVAL_MS > 0 && (uint32_t)(platform_millis() - prev_log_save) > LOG_SAVE_INTERVAL_MS))
     {
       g_logfile.write(log_get_buffer(&prev_log_pos));
       g_logfile.flush();
@@ -135,6 +143,7 @@ void init_logfile()
   bool truncate = first_open_after_boot;
   if (truncate)
   {
+    SD.remove("lastlog.txt");
     SD.rename(LOGFILE, "lastlog.txt");
   }
   int flags = O_WRONLY | O_CREAT | (truncate ? O_TRUNC : O_APPEND);
@@ -239,7 +248,7 @@ static const char * typeToChar(int deviceType)
     case S2S_CFG_FIXED:
       return "Fixed";
     case S2S_CFG_FLOPPY_14MB:
-      return "Floppy1.4MB";
+      return "Floppy";
     case S2S_CFG_MO:
       return "MO";
     case S2S_CFG_NETWORK:
@@ -272,6 +281,8 @@ static const char * quirksToChar(int quirks)
       return "XEBEC";
     case S2S_CFG_QUIRKS_X68000:
       return "X68000";
+    case S2S_CFG_QUIRKS_PC98_55:
+      return "PC-9801-55";
     case S2S_CFG_QUIRKS_NONE:
       return "None";
     default:
@@ -587,9 +598,11 @@ bool findHDDImages()
         // Parse SCSI device ID
         int file_name_length = strlen(name);
         if(file_name_length > 2) { // HD[N]
-          int tmp_id = name[HDIMG_ID_POS] - '0';
+          // Single ID character: '0'-'9', or 'A'-'F' for IDs 10-15 on wide
+          // (HD10 keeps meaning ID 1, LUN 0; ID 10 is HD_A/HDA0-style).
+          int tmp_id = scsiDecodeID(name[HDIMG_ID_POS]);
 
-          if(tmp_id > -1 && tmp_id < 8)
+          if(tmp_id > -1 && tmp_id < NUM_SCSIID)
           {
             id = tmp_id; // If valid id, set it, else use default
             use_prefix = true;
@@ -651,7 +664,7 @@ bool findHDDImages()
         if (is_zp) type = S2S_CFG_ZIP100;
         if (is_pr) type = S2S_CFG_PRINTER;
 
-        g_scsi_settings.initDevice(id & 7, type);
+        g_scsi_settings.initDevice(id & (NUM_SCSIID - 1), type);
         // Open the image file
         if (id < NUM_SCSIID && is_romdrive)
         {
@@ -894,7 +907,6 @@ STATIC_TESTABLE bool mountSDCard()
 
   // Do we have any kind of card?
   if (!SD.card() || SD.sdErrorCode() != 0) {
-    logmsg("SD Error Code: ", SD.sdErrorCode());
     return false;
   }
 
@@ -1015,7 +1027,7 @@ STATIC_TESTABLE void reinitSCSI()
       }
 #endif
       g_scsi_settings.initDevice(fallback_id, S2S_CFG_FIXED);
-      scsiDiskOpenHDDImage(RAW_FALLBACK_SCSI_ID, "RAW:0:0xFFFFFFFF", 0,
+      scsiDiskOpenHDDImage(fallback_id, "RAW:0:0xFFFFFFFF", 0,
                           RAW_FALLBACK_BLOCKSIZE);
   #else
       logmsg("No valid image files found!");
@@ -1079,6 +1091,65 @@ static void check_for_unused_update_files()
   }
 }
 
+// CRC32 nibble table, PKZIP polynomial
+static const uint32_t g_crc32_nibbles[16] = {
+  0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC,
+  0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
+  0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C,
+  0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C
+};
+
+__attribute__((optimize("Os")))
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
+{
+  for (size_t i = 0; i < len; i++)
+  {
+    crc ^= data[i];
+    crc = (crc >> 4) ^ g_crc32_nibbles[crc & 0x0F];
+    crc = (crc >> 4) ^ g_crc32_nibbles[crc & 0x0F];
+  }
+  return crc;
+}
+
+// Checks the extracted image against the size and CRC32 from the zip header.
+// Takes an already open file to keep firmware_update()'s stack frame down.
+__attribute__((optimize("Os"), noinline))
+static bool verify_extracted_firmware(FsFile &check, uint32_t expected_size,
+                                      uint32_t expected_crc, uint8_t *buf, size_t bufsize)
+{
+  if (check.fileSize() != expected_size)
+  {
+    logmsg("Extracted firmware is ", (int)check.fileSize(), " bytes on the card");
+    logmsg("Firmware package says ", (int)expected_size, " bytes");
+    return false;
+  }
+
+  uint32_t crc = 0xFFFFFFFF;
+  uint32_t total = 0;
+  int bytes_read;
+  while ((bytes_read = check.read(buf, bufsize)) > 0)
+  {
+    crc = crc32_update(crc, buf, bytes_read);
+    total += bytes_read;
+  }
+  crc ^= 0xFFFFFFFF;
+
+  if (total != expected_size)
+  {
+    logmsg("Could only read back ", (int)total, " bytes of the extracted firmware");
+    return false;
+  }
+
+  if (crc != expected_crc)
+  {
+    logmsg("Firmware CRC on the card: ", crc);
+    logmsg("Firmware CRC in the package: ", expected_crc);
+    return false;
+  }
+
+  return true;
+}
+
 // Update firmware by unzipping the firmware package
 __attribute__((optimize("Os")))
 static void firmware_update()
@@ -1125,19 +1196,20 @@ static void firmware_update()
   while ((bytes_read = file.read(buf, sizeof(buf))) > 0)
   {
     parsed_length = parser.Parse(buf, bytes_read);
-    if (parsed_length == sizeof(buf))
+    // bytes_read, not sizeof(buf): a short read would break both seeks below
+    if (parsed_length == bytes_read)
        continue;
     if (parsed_length >= 0)
     {
       if (!parser.FoundMatch())
       {
         parser.Reset();
-        file.seekSet(file.position() - (sizeof(buf) - parsed_length) + parser.GetCompressedSize());
+        file.seekSet(file.position() - (bytes_read - parsed_length) + parser.GetCompressedSize());
       }
       else
       {
         // seek to start of data in matching file
-        file.seekSet(file.position() - (sizeof(buf) - parsed_length));
+        file.seekSet(file.position() - (bytes_read - parsed_length));
         break;
       }
     }
@@ -1156,29 +1228,71 @@ static void firmware_update()
 
     logmsg("Unzipping matching firmware with prefix: ", FIRMWARE_NAME_PREFIX);
     FsFile target_firmware;
-    char firmware_name[64] = {0};
+    char firmware_name[sizeof(FIRMWARE_NAME_PREFIX) + 4] = {0};
     memcpy(firmware_name, FIRMWARE_NAME_PREFIX, sizeof(FIRMWARE_NAME_PREFIX) - 1);
     memcpy(firmware_name + sizeof(FIRMWARE_NAME_PREFIX) - 1, ".bin", sizeof(".bin"));
-    target_firmware.open(&root, firmware_name, O_BINARY | O_WRONLY | O_CREAT | O_TRUNC);
-    uint32_t position = 0;
-    while ((bytes_read = file.read(buf, sizeof(buf))) > 0)
+
+    const uint32_t expected_size = parser.GetCompressedSize();
+    const uint32_t expected_crc = parser.GetCrc();
+    bool extracted = false;
+
+    if (!target_firmware.open(&root, firmware_name, O_BINARY | O_WRONLY | O_CREAT | O_TRUNC))
     {
-      if (bytes_read > parser.GetCompressedSize() - position)
-        bytes_read =  parser.GetCompressedSize() - position;
-      target_firmware.write(buf, bytes_read);
-      position += bytes_read;
-      if (position >= parser.GetCompressedSize())
+      logmsg("Could not create the firmware image on the SD card");
+    }
+    else
+    {
+      uint32_t position = 0;
+      bool write_ok = true;
+      while (position < expected_size && (bytes_read = file.read(buf, sizeof(buf))) > 0)
       {
-        break;
+        if ((uint32_t)bytes_read > expected_size - position)
+          bytes_read = expected_size - position;
+
+        if (target_firmware.write(buf, bytes_read) != (size_t)bytes_read)
+        {
+          logmsg("SD card write failed at offset ", (int)position, " while extracting firmware");
+          write_ok = false;
+          break;
+        }
+        position += bytes_read;
+      }
+
+      if (write_ok && target_firmware.getWriteError())
+      {
+        logmsg("SD card reported a write error while extracting firmware");
+        write_ok = false;
+      }
+      target_firmware.close();
+
+      if (write_ok && position != expected_size)
+      {
+        logmsg("Firmware package ended early at byte ", (int)position, ", it is truncated");
+        write_ok = false;
+      }
+
+      if (write_ok)
+      {
+        // A write that never reached the card looks fine from the write side
+        if (!target_firmware.open(&root, firmware_name, O_BINARY | O_RDONLY))
+        {
+          logmsg("Could not reopen the extracted firmware to verify it");
+        }
+        else
+        {
+          extracted = verify_extracted_firmware(target_firmware, expected_size,
+                                                expected_crc, buf, sizeof(buf));
+          target_firmware.close();
+        }
       }
     }
-    // zip file has a central directory at the end of the file,
-    // so the compressed data should never hit the end of the file
-    // so bytes read should always be greater than 0 for a valid datastream
-    if (bytes_read > 0)
+
+    file.close();
+
+    if (extracted)
     {
-      target_firmware.close();
-      file.close();
+      // Drop the package only once the image verifies, so a bad
+      // extraction can still be retried
       root.remove(name);
       root.close();
       logmsg("Update extracted from package, rebooting MCU");
@@ -1186,14 +1300,20 @@ static void firmware_update()
     }
     else
     {
-      target_firmware.close();
-      logmsg("Error reading firmware package file");
       root.remove(firmware_name);
+      logmsg("Firmware update failed, keeping the package - power cycle to retry");
+      root.close();
     }
+    return;
   }
   file.close();
   root.close();
 }
+
+#ifdef UNIT_TEST
+// Test accessor - firmware_update() is static
+void bluescsi_test_firmware_update() { firmware_update(); }
+#endif
 
 // Checks if SD card is still present
 static bool poll_sd_card()
@@ -1313,6 +1433,26 @@ STATIC_TESTABLE void bluescsi_setup_sd_card(bool wait_for_card = true)
 
 #ifdef RECLOCKING_SUPPORTED
     bluescsi_speed_grade_t speed_grade = (bluescsi_speed_grade_t) g_scsi_settings.getSystem()->speedGrade;
+#if defined(BLUESCSI_ULTRA) && defined(BLUESCSI_NETWORK)
+    // The RM2 is reached over a PIO SPI bus whose divider is a compile-time
+    // constant sized for the stock clock, so the bus speed scales with clk_sys.
+    // Past the WifiRM2 grade the module stops answering, and it fails silently:
+    // cyw43_wifi_on() fails inside cyw43_wifi_set_up(), which returns void, so
+    // the interface is left down and every later scan/join returns -4 with
+    // nothing logged. Measured on an Ultra: the RM2 answers at 150MHz and is
+    // dead at 251MHz (TurboMax). When an RM2 is actually installed its clock wins
+    // over the configured grade - platform_network_supported() is only true
+    // here once the module answered the boot-time probe.
+    if (platform_network_supported() && speed_grade != SPEED_GRADE_WIFI_RM2)
+    {
+      logmsg("RM2 detected: overriding SpeedGrade \"", g_scsi_settings.getSpeedGradeString(),
+             "\" with \"WifiRM2\" - the RM2 does not respond at higher clocks");
+      // Update the setting itself, not just the local, so the reclock log below
+      // and every other reader report the grade actually in force.
+      speed_grade = SPEED_GRADE_WIFI_RM2;
+      g_scsi_settings.getSystem()->speedGrade = SPEED_GRADE_WIFI_RM2;
+    }
+#endif
     if (speed_grade != bluescsi_speed_grade_t::SPEED_GRADE_DEFAULT)
     { 
       logmsg("Speed grade set to ", g_scsi_settings.getSpeedGradeString(), " reclocking system");
@@ -1320,6 +1460,11 @@ STATIC_TESTABLE void bluescsi_setup_sd_card(bool wait_for_card = true)
       {
         logmsg("======== Reinitializing BlueSCSI after reclock ========");
         g_sdcard_present = mountSDCard();
+        if (!g_sdcard_present)
+        {
+          logmsg("SD card init failed after reclock, sdErrorCode: ", (int)SD.sdErrorCode(),
+                 " sdErrorData: ", (int)SD.sdErrorData());
+        }
       }
     }
     else

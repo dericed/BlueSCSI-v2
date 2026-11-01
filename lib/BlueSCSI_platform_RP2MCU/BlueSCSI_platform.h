@@ -1,5 +1,6 @@
 /**
  * ZuluSCSI™ - Copyright (c) 2022-2025 Rabbit Hole Computing™
+ * Copyright (c) 2026 Eric Helgeson <eric@bluescsi.com>
  *
  * ZuluSCSI™ firmware is licensed under the GPL version 3 or any later version.
  *
@@ -158,6 +159,15 @@ void platform_use_sca_led(void);
 // Specific error code tied to the MCU when the SD card is not detected
 uint8_t platform_no_sd_card_on_init_error_code();
 
+// True only if the given SdCard::errorCode() means the card itself refused to
+// store the data. Everything else is a transfer that did not complete, which
+// the host should retry rather than treat as a bad sector.
+bool platform_sd_error_is_medium_defect(uint8_t sd_error);
+
+// SdCard::errorCode() value for a transfer that ran out of time. Mirrors
+// SDIO_ERR_DATA_TIMEOUT; sd_card_sdio.cpp static_asserts the two agree.
+#define SD_ERROR_DATA_TIMEOUT 5
+
 // Query whether initiator mode is enabled on targets with PLATFORM_HAS_INITIATOR_MODE
 bool platform_is_initiator_mode_enabled();
 
@@ -169,6 +179,12 @@ extern bool __isPicoW;
 extern "C" {
 #endif
 bool platform_is_pico_w(void);
+
+// Put the Pico module's RT6150 regulator in PWM mode (true) or PFM mode (false).
+// Returns false on boards without that pin.
+bool platform_set_smps_pwm(bool on);
+// Re-apply a requested PWM mode after the CYW43 was reinitialised. Returns true if it did.
+bool platform_smps_pwm_restore(void);
 
 void platform_initiator_gpio_setup();
 bool platform_supports_initiator_mode();

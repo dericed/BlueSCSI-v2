@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2023-2026 joshua stein <jcs@jcs.org>
+ * Copyright (c) 2026 Eric Helgeson <eric@bluescsi.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -180,6 +181,8 @@ void scsiNetworkWifiInfo(void)
 	wifi_cur.rssi = platform_network_wifi_rssi();
 
 	wifi_cur.channel = platform_network_wifi_channel();
+
+	wifi_cur.flags = platform_network_wifi_flags();
 
 	scsiDev.data[0] = (entrysize >> 8) & 0xff;
 	scsiDev.data[1] = entrysize & 0xff;
@@ -452,9 +455,9 @@ int scsiNetworkCommand()
 		// set mode (ignored)
 		break;
 
-	// custom wifi commands all using the same opcode, with a sub-command in cdb[2]
+	// custom wifi commands all using the same opcode, with a sub-command in cdb[1]
 	case SCSI_NETWORK_WIFI_CMD:
-		DBGMSG_F("------ in scsiNetworkCommand with wi-fi command 0x%02x (size %d)", scsiDev.cdb[2], size);
+		DBGMSG_F("------ in scsiNetworkCommand with wi-fi command 0x%02x (size %d)", scsiDev.cdb[1], size);
 
 		switch (scsiDev.cdb[1]) {
 		case SCSI_NETWORK_WIFI_CMD_SCAN:

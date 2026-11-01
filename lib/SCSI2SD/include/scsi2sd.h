@@ -1,5 +1,6 @@
 //	Copyright (C) 2014 Michael McMaster <michael@codesrc.com>
 //	Copyright (c) 2023 joshua stein <jcs@jcs.org>
+//	Copyright (c) 2026 Eric Helgeson <eric@bluescsi.com>
 //
 //	This file is part of SCSI2SD.
 //
@@ -42,12 +43,18 @@ extern "C" {
 
 #include "stdint.h"
 
+// Wide SCSI addresses 16 target IDs (0-15), narrow addresses 8 (0-7).
+// Array dimensions, loop bounds and ID masks all derive from this constant.
+#if defined(BLUESCSI_ULTRA_WIDE)
+#define S2S_MAX_TARGETS 16
+#else
 #define S2S_MAX_TARGETS 8
+#endif
 #define S2S_CFG_SIZE (S2S_MAX_TARGETS * sizeof(S2S_TargetCfg) + sizeof(S2S_BoardCfg))
 
 typedef enum
 {
-	S2S_CFG_TARGET_ID_BITS = 0x07,
+	S2S_CFG_TARGET_ID_BITS = S2S_MAX_TARGETS - 1,
 	S2S_CFG_TARGET_ENABLED = 0x80
 } S2S_CFG_TARGET_FLAGS;
 
@@ -93,7 +100,8 @@ typedef enum
 	S2S_CFG_QUIRKS_XEBEC = 4,
 	S2S_CFG_QUIRKS_VMS = 8,
 	S2S_CFG_QUIRKS_X68000 = 16,
-	S2S_CFG_QUIRKS_EWSD = 32
+	S2S_CFG_QUIRKS_EWSD = 32,
+	S2S_CFG_QUIRKS_PC98_55 = 64
 } S2S_CFG_QUIRKS;
 
 typedef enum
@@ -166,7 +174,9 @@ typedef struct __attribute__((packed))
 
 	uint8_t busWidth; // Wide bus support, 0: 8-bit, 1: 16-bit, 2: 32-bit
 
-	uint8_t reserved[17]; // Pad out to 128 bytes
+	uint8_t wifiSecurity; // bluescsi_wifi_security_t, 0: WPA/WPA2 mixed PSK
+
+	uint8_t reserved[16]; // Pad out to 128 bytes
 } S2S_BoardCfg;
 
 typedef enum

@@ -1,5 +1,6 @@
 /**
  * ZuluSCSI™ - Copyright (c) 2022-2025 Rabbit Hole Computing™
+ * Copyright (c) 2025-2026 Eric Helgeson <eric@bluescsi.com>
  *
  * ZuluSCSI™ firmware is licensed under the GPL version 3 or any later version.
  *
@@ -45,6 +46,7 @@ extern "C" {
 #include <hardware/sync.h>
 #include <hardware/vreg.h>
 #include <hardware/watchdog.h>
+#include <hardware/structs/scb.h>
 #include <hardware/structs/watchdog.h>
 #include <pico/bootrom.h>
 #include "scsi_accel_target.h"
@@ -174,6 +176,43 @@ bool platform_is_pico_w(void)
     return __isPicoW;
 }
 
+// The Pico, Pico W, Pico 2 and Pico 2 W modules regulate 3.3 V with an RT6150.
+// Its PS pin selects PFM mode (the default, efficient at light load, more ripple)
+// or PWM mode. The S/PDIF DAC board runs from that rail and its receiver PLL
+// drops out on the PFM ripple whenever the SD card draws a burst (#438).
+static bool g_smps_pwm_wanted = false;
+
+bool platform_set_smps_pwm(bool on)
+{
+#if defined(BLUESCSI_ULTRA) || defined(BLUESCSI_ULTRA_WIDE) || defined(BLUESCSI_RM2)
+    (void)on;
+    return false;
+#else
+    g_smps_pwm_wanted = on;
+    if (platform_is_pico_w())
+    {
+#if PICO_CYW43_SUPPORTED
+        // On a Pico W the pin belongs to the CYW43, so the chip must stay powered
+        // and any code that reinitialises it has to call platform_smps_pwm_restore()
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_SMPS_PIN, on);
+        return true;
+#else
+        return false;
+#endif
+    }
+    // Pico and Pico 2 without wireless: the pin is GPIO 23, unused by the v2 pin map
+    gpio_init(23);
+    gpio_set_dir(23, GPIO_OUT);
+    gpio_put(23, on);
+    return true;
+#endif
+}
+
+bool platform_smps_pwm_restore(void)
+{
+    return g_smps_pwm_wanted && platform_set_smps_pwm(true);
+}
+
 /***************/
 /* GPIO init   */
 /***************/
@@ -220,6 +259,16 @@ static void CheckPicoW() {
     //__isPicoW = false;
 }
 #else
+/* The detection pin is the CYW43 clock line (GPIO29 / ADC3) on a W board and the
+ * VSYS/3 divider on a non-W Pico. CYW43_PIN_WL_CLOCK only exists when the CYW43
+ * driver is part of the build, so fall back to the same pin number by hand -
+ * reading an ADC needs no driver. */
+#ifdef CYW43_PIN_WL_CLOCK
+#define PICOW_DETECT_PIN CYW43_PIN_WL_CLOCK
+#else
+#define PICOW_DETECT_PIN 29u
+#endif
+
     /**
      * Runtime Pico W detection via ADC on CYW43 clock pin.
      * Works on both RP2040 and RP2350.
@@ -227,24 +276,25 @@ static void CheckPicoW() {
      */
 static void CheckPicoW() {
     extern bool __isPicoW;
-#ifndef BLUESCSI_NETWORK
-    __isPicoW = false;
-#else
+    /* Detection must run in EVERY build, not just BLUESCSI_NETWORK ones. Pico W
+     * hardware is routinely flashed with non-network firmware, and a build that
+     * wrongly assumes non-W then treats GPIO24 as VBUS in platform_sense_msc().
+     * On a W that pin belongs to the CYW43, reads low, and USB mass storage mode
+     * is refused - silently, because that check returns before the first dbgmsg.
+     * The ADC probe below needs no CYW43 driver, so there is no reason to gate
+     * it; it is the same probe the network builds have always used. */
+    const uint detect_pin = PICOW_DETECT_PIN;
     adc_init();
-    auto dir = gpio_get_dir(CYW43_PIN_WL_CLOCK);
-    auto fnc = gpio_get_function(CYW43_PIN_WL_CLOCK);
-    adc_gpio_init(CYW43_PIN_WL_CLOCK);
-    adc_select_input(3);
-    auto adc29 = adc_read();
-    gpio_set_function(CYW43_PIN_WL_CLOCK, fnc);
-    gpio_set_dir(CYW43_PIN_WL_CLOCK, dir);
-    dbgmsg("CheckPicoW adc29: %d", adc29);
-    if (adc29 < 200) {
-        __isPicoW = true; // PicoW || Pico2W
-    } else {
-        __isPicoW = false;
-    }
-#endif
+    auto dir = gpio_get_dir(detect_pin);
+    auto fnc = gpio_get_function(detect_pin);
+    adc_gpio_init(detect_pin);
+    adc_select_input(detect_pin - 26); // ADC0..3 are GPIO26..29
+    auto adc_raw = adc_read();
+    gpio_set_function(detect_pin, fnc);
+    gpio_set_dir(detect_pin, dir);
+    // dbgmsg concatenates its arguments, it is not printf - no format specifiers.
+    dbgmsg("CheckPicoW adc", (int)detect_pin, ": ", (int)adc_raw);
+    __isPicoW = (adc_raw < 200); // PicoW || Pico2W hold the line low
 }
 #endif
 
@@ -273,7 +323,11 @@ bool check_is_sca_model() {
         status = i2c_write_timeout_us(I2C_PORT, SCA_I2C_ADDR_PROTO, cmd, 1, true, 25000);
         if (status > 0) {
             status = i2c_read_timeout_us(I2C_PORT, SCA_I2C_ADDR_PROTO, &response, 1, false, 25000);
-            is_sca_proto = true;
+            // Only latch the prototype path once the chip actually responds,
+            // so a failed probe doesn't leave later reads addressing it.
+            if (status > 0) {
+                is_sca_proto = true;
+            }
         }
         return status > 0;
     }
@@ -841,6 +895,10 @@ void platform_init()
     // Only needed on RP2040 — see comment at __usb_timer_task definition.
     __usb_task_irq = user_irq_claim_unused(true);
     irq_set_exclusive_handler(__usb_task_irq, __usb_irq);
+    // Run tud_task() at the lowest IRQ priority so the SCSI-critical IRQs
+    // (DMA_IRQ_0 buffer-swap, selection-detect GPIO) — which sit at the
+    // default priority - always preempt an in-progress tud_task(). tud_task()
+    irq_set_priority(__usb_task_irq, PICO_LOWEST_IRQ_PRIORITY);
     irq_set_enabled(__usb_task_irq, true);
     add_alarm_in_us(1000, __usb_timer_task, NULL, true);
 #endif
@@ -1458,7 +1516,6 @@ static void usb_input_poll()
                 mass_storage_reboot_keyed = true;
                 basic_reboot_keyed = uf2_reboot_keyed = false;
                 logmsg("Boot into mass storage requested, press 'y' to engage or any key to clear");
-                *scratch0 = REBOOT_INTO_MASS_STORAGE_MAGIC_NUM;
                 break;
             case 'B':
             case 'b':
@@ -1482,9 +1539,30 @@ static void usb_input_poll()
                 break;
             case 'Y':
             case 'y':
-                if (basic_reboot_keyed || mass_storage_reboot_keyed)
+                if (mass_storage_reboot_keyed)
                 {
-                    logmsg("Rebooting", mass_storage_reboot_keyed ? " into mass storage": "");
+                    logmsg("Rebooting into mass storage");
+                    // A watchdog reset drops the supply on some boards (Ultra Wide
+                    // reports HAD_POR afterwards), wiping the scratch0 magic.
+                    // SYSRESETREQ keeps the watchdog block powered so it survives.
+                    // Arm only once confirmed. Setting it on 'm' outlived
+                    // "Cleared reboot setting" and any later reset booted into
+                    // mass storage.
+                    *scratch0 = REBOOT_INTO_MASS_STORAGE_MAGIC_NUM;
+                    // platform_delay_ms_with_usb() only runs tud_task(); usb_log_poll()
+                    // is what moves the log into the CDC FIFO, so pump both or the
+                    // message above never reaches the console before the reset.
+                    for (int i = 0; i < 20; i++)
+                    {
+                        usb_log_poll();
+                        platform_delay_ms_with_usb(10);
+                    }
+                    scb_hw->aircr = 0x05FA0004;
+                    while (1);
+                }
+                else if (basic_reboot_keyed)
+                {
+                    logmsg("Rebooting");
                     watchdog_reboot(0, 0, 2000);
                 } else if (uf2_reboot_keyed) {
                     rom_reset_usb_boot(0, 0);

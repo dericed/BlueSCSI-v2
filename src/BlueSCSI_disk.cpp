@@ -1,7 +1,7 @@
 /**
  * SCSI2SD V6 - Copyright (C) 2013 Michael McMaster <michael@codesrc.com>
  * Portions Copyright (C) 2014 Doug Brown <doug@downtowndougbrown.com>
- * Copyright (C) 2023 Eric Helgeson
+ * Copyright (c) 2023-2026 Eric Helgeson <eric@bluescsi.com>
  * ZuluSCSI™ - Copyright (c) 2022-2025 Rabbit Hole Computing™
  *
  * This file is licensed under the GPL version 3 or any later version. 
@@ -28,6 +28,7 @@
 // It is derived from disk.c in SCSI2SD V6.
 
 #include "BlueSCSI_disk.h"
+#include "floppy.h"
 #include "BlueSCSI_log.h"
 #include "BlueSCSI_config.h"
 #include "BlueSCSI_settings.h"
@@ -39,6 +40,7 @@
 #include "ImageBackingStore.h"
 #include "ROMDrive.h"
 #include "QuirksCheck.h"
+#include "BlueSCSI_vhd.h"
 #include <minIni.h>
 #include <string.h>
 #include <strings.h>
@@ -130,6 +132,27 @@ char scsiEncodeID(uint8_t scsi_id)
         return 'A' + (scsi_id - 0xA);
     return '\0';
 }
+
+// Inverse of scsiEncodeID: decode a filename ID character ('0'-'9', case
+// insensitive 'A'-'F') to 0..15, or -1 if not a valid SCSI ID character.
+// Same single-character convention as ZuluSCSI, so wide SD cards move
+// between products (HD_A/HDB0-style names mean IDs 10/11 on both).
+int scsiDecodeID(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f')
+        return 10 + (c - 'a');
+    return -1;
+}
+
+// The target path sizes arrays with S2S_MAX_TARGETS while the image/INI path
+// uses NUM_SCSIID; they must stay in lock-step or IDs would be addressable in
+// one path but out of bounds in the other.
+static_assert(NUM_SCSIID == S2S_MAX_TARGETS,
+              "NUM_SCSIID and S2S_MAX_TARGETS must match");
 
 /************************************************/
 /* ROM drive support (in microcontroller flash) */
@@ -378,6 +401,28 @@ static bool find_chs_capacity(uint64_t lba, uint16_t max_cylinders, uint8_t min_
     return found_chs;
 }
 
+// Match a floppy image against the standard formats by size so the geometry
+// and MODE SENSE page 05h describe the disk that is actually mounted.
+static bool find_floppy_geometry(image_config_t &img, uint16_t &c, uint8_t &h, uint8_t &s)
+{
+    if (img.deviceType != S2S_CFG_FLOPPY_14MB)
+        return false;
+
+    const S2S_FloppyFormat *format = s2s_floppyFormat(img.scsiSectors, img.bytesPerSector);
+    if (!format)
+    {
+        logmsg("---- WARNING: ", (int)img.scsiSectors, " x ", (int)img.bytesPerSector,
+               " byte blocks is not a standard floppy size, using a derived geometry");
+        return false;
+    }
+
+    logmsg("---- Floppy format: ", format->name);
+    c = format->cylinders;
+    h = format->heads;
+    s = format->sectorsPerTrack;
+    return true;
+}
+
 static void autoConfigGeometry(image_config_t &img)
 {
     const char *method = "INI config";
@@ -388,12 +433,10 @@ static void autoConfigGeometry(image_config_t &img)
         uint8_t sect = 63;
         bool found_chs = false;
 
-        if (img.deviceType == S2S_CFG_FLOPPY_14MB && img.scsiSectors <= 2880)
+        if (find_floppy_geometry(img, cyl, head, sect))
         {
-            method = "device type floppy";
-            sect = 18;
-            head = 80;
             found_chs = true;
+            method = "floppy format";
         }
         else if (img.scsiSectors <= 1032192)
         {
@@ -436,6 +479,48 @@ static void autoConfigGeometry(image_config_t &img)
                " total sectors ", (int) img.scsiSectors,
                " (divisible)"
         );
+}
+
+// Read and validate a VHD footer from an already-open ImageBackingStore.
+// Returns true and populates info on VHD_PARSE_OK; returns false on any error
+// (caller should close the file and reject the image).
+static bool tryLoadVhdFooter(ImageBackingStore &file, const char *filename,
+                             vhd_footer_info_t *info)
+{
+    uint64_t filesize = file.size();
+    if (filesize < VHD_FOOTER_SIZE)
+    {
+        logmsg("---- VHD file too small (", (int)filesize, " bytes), ignoring: ", filename);
+        return false;
+    }
+
+    uint8_t footer[VHD_FOOTER_SIZE];
+    if (!file.seek(filesize - VHD_FOOTER_SIZE) ||
+        file.read(footer, VHD_FOOTER_SIZE) != (ssize_t)VHD_FOOTER_SIZE)
+    {
+        logmsg("---- Failed to read VHD footer from ", filename);
+        return false;
+    }
+
+    int rc = vhd_parse_fixed_footer(footer, VHD_FOOTER_SIZE, info);
+    if (rc != VHD_PARSE_OK)
+    {
+        const char *reason = "unknown error";
+        switch (rc) {
+            case VHD_PARSE_ERR_COOKIE:       reason = "missing conectix cookie"; break;
+            case VHD_PARSE_ERR_VERSION:      reason = "unsupported format version"; break;
+            case VHD_PARSE_ERR_CHECKSUM:     reason = "footer checksum mismatch"; break;
+            case VHD_PARSE_ERR_TYPE_DYNAMIC: reason = "Dynamic VHD not supported (fixed only)"; break;
+            case VHD_PARSE_ERR_TYPE_DIFF:    reason = "Differencing VHD not supported (fixed only)"; break;
+            case VHD_PARSE_ERR_TYPE_UNKNOWN: reason = "unknown VHD disk type"; break;
+            case VHD_PARSE_ERR_SIZE:         reason = "invalid current size"; break;
+        }
+        logmsg("---- Invalid VHD: ", filename, " (", reason, ")");
+        return false;
+    }
+
+    file.seek(0);
+    return true;
 }
 
 bool scsiDiskOpenHDDImage(int target_idx, const char *filename, int scsi_lun, int blocksize, S2S_CFG_TYPE type, bool use_prefix)
@@ -497,10 +582,49 @@ bool scsiDiskOpenHDDImage(int target_idx, const char *filename, int scsi_lun, in
         img.file = ImageBackingStore(filename, blocksize);
     }
 
+    // VHD detection: parse footer before computing capacity/geometry.
+    // .vhd is restricted to disk images — on other device types we reject it.
+    bool is_vhd = hasExtension(filename, ".vhd");
+    vhd_footer_info_t vhd_info;
+    bool vhd_ok = false;
+    if (is_vhd && img.file.isOpen())
+    {
+        S2S_CFG_TYPE effective_type = (S2S_CFG_TYPE) g_scsi_settings.getDevice(target_idx)->deviceType;
+        if (effective_type == S2S_CFG_NOT_SET) effective_type = type;
+        if (effective_type != S2S_CFG_FIXED)
+        {
+            logmsg("---- Rejecting .vhd on non-HD device type ", (int)effective_type,
+                   " for ", filename, " (VHD is disk-only)");
+            img.file.close();
+            return false;
+        }
+        if (blocksize != 512)
+        {
+            logmsg("---- Rejecting .vhd ", filename, " with blocksize ",
+                   (int)blocksize, " (VHD spec mandates 512-byte sectors)");
+            img.file.close();
+            return false;
+        }
+        if (!tryLoadVhdFooter(img.file, filename, &vhd_info))
+        {
+            img.file.close();
+            return false;
+        }
+        vhd_ok = true;
+        logmsg("---- VHD creator '", vhd_info.creator_app,
+               "' os '", vhd_info.creator_os,
+               "' size ", (int)(vhd_info.current_size >> 20), " MiB CHS ",
+               (int)vhd_info.cylinders, "/",
+               (int)vhd_info.heads, "/",
+               (int)vhd_info.sectors_per_track);
+    }
+
     if (img.file.isOpen())
     {
         img.bytesPerSector = blocksize;
-        img.scsiSectors = img.file.size() / blocksize;
+        img.scsiSectors = vhd_ok
+            ? (uint32_t)(vhd_info.current_size / blocksize)
+            : (uint32_t)(img.file.size() / blocksize);
         img.scsiId = target_idx | S2S_CFG_TARGET_ENABLED;
         img.sdSectorStart = 0;
 
@@ -539,6 +663,23 @@ bool scsiDiskOpenHDDImage(int target_idx, const char *filename, int scsi_lun, in
         {
             logmsg("---- Configuring as disk drive");
             img.deviceType = S2S_CFG_FIXED;
+
+            if (vhd_ok)
+            {
+                // CHS from footer — only if INI didn't override. scsiDiskSetImageConfig
+                // already copied INI values into img.*Track / *Cylinder; if those are
+                // zero, INI left them unset and we can use the footer's geometry.
+                if (img.sectorsPerTrack == 0 && img.headsPerCylinder == 0
+                    && vhd_info.sectors_per_track > 0 && vhd_info.heads > 0)
+                {
+                    img.sectorsPerTrack  = vhd_info.sectors_per_track;
+                    img.headsPerCylinder = vhd_info.heads;
+                    dbgmsg("---- VHD CHS applied: SPT=", (int)img.sectorsPerTrack,
+                           " H=", (int)img.headsPerCylinder);
+                }
+                // UUID -> serial, unconditionally overriding INI. Serial follows the file.
+                vhd_uuid_to_serial(vhd_info.uuid, img.serial);
+            }
         }
         else if (type == S2S_CFG_OPTICAL)
         {
@@ -846,8 +987,9 @@ bool scsiDiskFolderIsTapeFolder(FsFile *dir)
     dir->getName(filename, sizeof(filename));
     // string starts with 'tp', the 3rd character is a SCSI ID, and it has more 3 charters
     // e.g. "tp0 - tape 01"
+    int tp_id = scsiDecodeID(filename[2]);
     if (strlen(filename) > 3 && strncasecmp("tp", filename, 2) == 0
-        && filename[2] >= '0' && filename[2] - '0' < NUM_SCSIID)
+        && tp_id >= 0 && tp_id < NUM_SCSIID)
     {
         return true;
     }
@@ -860,8 +1002,9 @@ bool scsiDiskFolderIsPrinterFolder(FsFile *dir)
     // as the spool target. The 3rd character must be a valid SCSI ID digit.
     char filename[MAX_FILE_PATH + 1];
     dir->getName(filename, sizeof(filename));
+    int pr_id = scsiDecodeID(filename[2]);
     if (strlen(filename) >= 3 && strncasecmp("pr", filename, 2) == 0
-        && filename[2] >= '0' && filename[2] - '0' < NUM_SCSIID)
+        && pr_id >= 0 && pr_id < NUM_SCSIID)
     {
         return true;
     }
@@ -896,8 +1039,8 @@ static void scsiDiskSetConfig(int target_idx)
 
     scsiDiskSetImageConfig(target_idx);
 
-    char section[6] = "SCSI0";
-    section[4] += target_idx;
+    char section[8];
+    snprintf(section, sizeof(section), "SCSI%d", target_idx);
     char tmp[32];
 
     ini_gets(section, "ImgDir", "", tmp, sizeof(tmp), CONFIGFILE);
@@ -909,31 +1052,31 @@ static void scsiDiskSetConfig(int target_idx)
     else
     {
         strcpy(tmp, "HD0");
-        tmp[2] += target_idx;
+        tmp[2] = scsiEncodeID(target_idx);
         scsiDiskCheckDir(tmp, target_idx, &img, S2S_CFG_FIXED, "disk");
 
         strcpy(tmp, "CD0");
-        tmp[2] += target_idx;
+        tmp[2] = scsiEncodeID(target_idx);
         scsiDiskCheckDir(tmp, target_idx, &img, S2S_CFG_OPTICAL, "optical");
 
         strcpy(tmp, "RE0");
-        tmp[2] += target_idx;
+        tmp[2] = scsiEncodeID(target_idx);
         scsiDiskCheckDir(tmp, target_idx, &img, S2S_CFG_REMOVABLE, "removable");
 
         strcpy(tmp, "MO0");
-        tmp[2] += target_idx;
+        tmp[2] = scsiEncodeID(target_idx);
         scsiDiskCheckDir(tmp, target_idx, &img, S2S_CFG_MO, "magneto-optical");
 
         strcpy(tmp, "TP0");
-        tmp[2] += target_idx;
+        tmp[2] = scsiEncodeID(target_idx);
         scsiDiskCheckDir(tmp, target_idx, &img, S2S_CFG_SEQUENTIAL, "tape");
 
         strcpy(tmp, "FD0");
-        tmp[2] += target_idx;
+        tmp[2] = scsiEncodeID(target_idx);
         scsiDiskCheckDir(tmp, target_idx, &img, S2S_CFG_FLOPPY_14MB, "floppy");
 
         strcpy(tmp, "ZP0");
-        tmp[2] += target_idx;
+        tmp[2] = scsiEncodeID(target_idx);
         scsiDiskCheckDir(tmp, target_idx, &img, S2S_CFG_ZIP100, "Iomega Zip 100");
 
     }
@@ -1029,8 +1172,8 @@ int findNextImageAfter(image_config_t &img,
     char candidate_name[MAX_FILE_PATH] = {'\0'};
     FsFile file;
     const uint8_t target = img.getTargetId();
-    char section[6] = "SCSI0";
-    section[4] = '0' + target;
+    char section[8];
+    snprintf(section, sizeof(section), "SCSI%d", (int)target);
 
     // See if we have a current image set in the ini file:
     ini_gets(section, "Img0", "", candidate_name, sizeof(candidate_name), CONFIGFILE);
@@ -1132,8 +1275,8 @@ int scsiDiskGetNextImageName(image_config_t &img, char *buf, size_t buflen)
 {
     int target_idx = img.getTargetId();
 
-    char section[6] = "SCSI0";
-    section[4] = '0' + target_idx;
+    char section[8];
+    snprintf(section, sizeof(section), "SCSI%d", target_idx);
 
     // sanity check: is provided buffer is long enough to store a filename?
     assert(buflen >= MAX_FILE_PATH);
@@ -1188,7 +1331,7 @@ int scsiDiskGetNextImageName(image_config_t &img, char *buf, size_t buflen)
                     dbgmsg("No matching device type for default directory found");
                     return 0;
             }
-            dirname[2] += target_idx;
+            dirname[2] = scsiEncodeID(target_idx);
             if (!SD.exists(dirname))
             {
                 dbgmsg("Default image directory, ", dirname, " does not exist");
@@ -1602,6 +1745,14 @@ void s2s_configInit(S2S_BoardCfg* config)
     {
         memcpy(config->wifiPassword, tmp, sizeof(config->wifiPassword));
         logmsg("-- WiFiPassword = [set]");
+    }
+
+    memset(tmp, 0, sizeof(tmp));
+    ini_gets("SCSI", "WiFiSecurity", "", tmp, sizeof(tmp), CONFIGFILE);
+    if (tmp[0])
+    {
+        config->wifiSecurity = g_scsi_settings.stringToWifiSecurity(tmp);
+        logmsg("-- WiFiSecurity = ", tmp);
     }
 
 }
@@ -2053,6 +2204,27 @@ static void diskSpecialDataOutStop()
     scsiDev.dataLen = 0;
 }
 
+// Pick the sense for a failed SD write. Only a card that refused the data is a
+// medium defect; 0x0C02 tells the host the sector is dead and unreallocatable,
+// so it retires the block instead of retrying. A transfer that timed out or
+// failed CRC has damaged nothing and belongs under ABORTED COMMAND, which hosts
+// do retry.
+void diskWriteErrorSense(uint8_t sd_error, uint8_t *sense_key, uint16_t *asc)
+{
+    if (platform_sd_error_is_medium_defect(sd_error))
+    {
+        *sense_key = MEDIUM_ERROR;
+        *asc = WRITE_ERROR_AUTO_REALLOCATION_FAILED;
+    }
+    else
+    {
+        *sense_key = ABORTED_COMMAND;
+        *asc = (sd_error == SD_ERROR_DATA_TIMEOUT)
+                   ? LOGICAL_UNIT_COMMUNICATION_TIMEOUT
+                   : LOGICAL_UNIT_COMMUNICATION_FAILURE;
+    }
+}
+
 static void diskSpecialDataOutError(uint8_t sense_code, uint16_t asc)
 {
     diskSpecialDataOutStop();
@@ -2374,9 +2546,13 @@ static void diskWriteVerifyDataOut()
 
     if (img.file.write(writeBuffer, chunkBytes) != chunkBytes)
     {
+        uint8_t sd_error = SD.card()->errorCode();
+        uint8_t sense_key;
+        uint16_t asc;
+        diskWriteErrorSense(sd_error, &sense_key, &asc);
         logmsg("SD card write failed during WRITE AND VERIFY at sector ", (int)chunkLba,
-              " SCSI ID", (int)scsiDev.target->targetId, " error ", SD.sdErrorCode());
-        diskSpecialDataOutError(MEDIUM_ERROR, WRITE_ERROR_AUTO_REALLOCATION_FAILED);
+              " SCSI ID", (int)scsiDev.target->targetId, " error ", (int)sd_error);
+        diskSpecialDataOutError(sense_key, asc);
         return;
     }
 
@@ -2392,7 +2568,7 @@ static void diskWriteVerifyDataOut()
     if (img.file.read(verifyBuffer, chunkBytes) != chunkBytes)
     {
         logmsg("SD card read failed during WRITE AND VERIFY at sector ", (int)chunkLba,
-              " SCSI ID", (int)scsiDev.target->targetId, " error ", SD.sdErrorCode());
+              " SCSI ID", (int)scsiDev.target->targetId, " error ", (int)SD.card()->errorCode());
         diskSpecialDataOutError(MEDIUM_ERROR, UNRECOVERED_READ_ERROR);
         return;
     }
@@ -2582,10 +2758,14 @@ void diskDataOut()
             platform_set_sd_callback(&diskDataOut_callback, buf);
             if (img.file.write(buf, len) != len)
             {
-                logmsg("SD card write failed: ", SD.sdErrorCode());
+                uint8_t sd_error = SD.card()->errorCode();
+                uint8_t sense_key;
+                uint16_t asc;
+                diskWriteErrorSense(sd_error, &sense_key, &asc);
+                logmsg("SD card write failed: ", (int)sd_error);
                 scsiDev.status = CHECK_CONDITION;
-                scsiDev.target->sense.code = MEDIUM_ERROR;
-                scsiDev.target->sense.asc = WRITE_ERROR_AUTO_REALLOCATION_FAILED;
+                scsiDev.target->sense.code = sense_key;
+                scsiDev.target->sense.asc = asc;
                 scsiDev.phase = STATUS;
             }
             platform_set_sd_callback(NULL, NULL);
@@ -2756,10 +2936,16 @@ static void start_dataInTransfer(uint8_t *buffer, uint32_t count)
     image_config_t &img = *(image_config_t*)scsiDev.target->cfg;
     platform_set_sd_callback(&diskDataIn_callback, buffer);
 
-    // Use direct sector I/O when fastseek is enabled (for fragmented files)
-    // Contiguous files already use raw SD access, bypassing this path
+    // Use direct sector I/O when fastseek is enabled (for fragmented files).
+    // Contiguous files already use raw SD access, bypassing this path.
+    // Direct reads address the card in whole 512-byte SD sectors, so both the
+    // position and the length must be sector aligned. 512-byte and larger
+    // block sizes (CD-ROM 2048 etc.) always are; 256-byte images usually are
+    // not, and truncating them here silently corrupts the transfer.
     bool read_ok = false;
-    if (img.file.isFastSeekEnabled())
+    bool sector_aligned = ((img.file.position() % SD_SECTOR_SIZE) == 0) &&
+                          ((count % SD_SECTOR_SIZE) == 0);
+    if (img.file.isFastSeekEnabled() && sector_aligned)
     {
         // Convert byte position/count to sector units (>> 9 is / 512)
         uint32_t fileSector = img.file.position() >> 9;
@@ -2797,6 +2983,11 @@ static void start_dataInTransfer(uint8_t *buffer, uint32_t count)
     // a large transfer compared to its transfer speed.
     platform_reset_watchdog();
 }
+
+#ifdef UNIT_TEST
+/* Test accessor - exercises the SD read path selection in start_dataInTransfer() */
+void testStartDataInTransfer(uint8_t *buffer, uint32_t count) { start_dataInTransfer(buffer, count); }
+#endif
 
 static void diskDataIn()
 {

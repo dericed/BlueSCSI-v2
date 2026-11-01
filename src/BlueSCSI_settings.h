@@ -2,7 +2,7 @@
  * This file is originally part of ZuluSCSI adopted for BlueSCSI
  *
  * ZuluSCSI™ - Copyright (c) 2023-2025 Rabbit Hole Computing™
- * Copyright (c) 2023 Eric Helgeson
+ * Copyright (c) 2023-2026 Eric Helgeson <eric@bluescsi.com>
  * 
  * This file is licensed under the GPL version 3 or any later version.  
  * 
@@ -40,6 +40,18 @@ typedef enum
     SPEED_GRADE_BASE_155MHZ,
 } bluescsi_speed_grade_t;
 
+// Wi-Fi security mode requested by the WiFiSecurity setting.
+// WIFI_SECURITY_WPA2 must stay 0 so a zeroed S2S_BoardCfg keeps the
+// long-standing default when the setting is absent.
+// must be in the same order as wifi_security_strings[] in BlueSCSI_settings.cpp
+typedef enum
+{
+    WIFI_SECURITY_WPA2 = 0, // WPA/WPA2 mixed PSK, widest compatibility
+    WIFI_SECURITY_WPA2_AES, // WPA2 AES PSK only, refuses TKIP
+    WIFI_SECURITY_WPA3,     // WPA3 SAE only
+    WIFI_SECURITY_WPA3_WPA2,// WPA3 SAE, also programming the WPA2 PSK
+} bluescsi_wifi_security_t;
+
 #ifdef __cplusplus
 
 #include <stdint.h>
@@ -47,9 +59,9 @@ typedef enum
 #include <scsi2sd.h>
 
 
-// Index 8 is the system defaults
-// Index 0-7 represent device settings
-#define SCSI_SETTINGS_SYS_IDX 8
+// The last m_dev slot holds the system defaults, the slots below it the
+// per-device settings (0-7, or 0-15 on wide).
+#define SCSI_SETTINGS_SYS_IDX S2S_MAX_TARGETS
 
 typedef enum
 {
@@ -62,6 +74,7 @@ typedef enum
     SYS_PRESET_X68000_SCSI,
     SYS_PRESET_X68000_SASI,
     SYS_PRESET_NeXT,
+    SYS_PRESET_PC_9801_55,
     SYS_PRESET_GENERIC,
 } scsi_system_preset_t;
 
@@ -177,6 +190,9 @@ public:
 
     // convert string to speed grade
     bluescsi_speed_grade_t stringToSpeedGrade(const char *speed_grade_str, size_t length);
+
+    // convert string to Wi-Fi security mode
+    bluescsi_wifi_security_t stringToWifiSecurity(const char *wifi_security_str);
 
     const char* getSpeedGradeString();
 

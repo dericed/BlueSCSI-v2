@@ -1,5 +1,6 @@
 /** 
  * ZuluSCSI™ - Copyright (c) 2022-2025 Rabbit Hole Computing™
+ * Copyright (c) 2026 Eric Helgeson <eric@bluescsi.com>
  * 
  * ZuluSCSI™ firmware is licensed under the GPL version 3 or any later version. 
  * 
@@ -148,12 +149,22 @@ SECTIONS
          */
         *BlueSCSI_log.cpp.o(.text .text*)
         *BlueSCSI_log_trace.cpp.o(.text .text*)
+        /* logmsg<> instantiations land in whichever object used them first,
+         * so the rule above misses them */
+        *(.text*_Z6logmsgIJ*)
 
         /* ROM drive setup and FW upgrade that is done only during init */
         *(.text*romDriveClear*)
         *(.text*romDriveCheckPresent*)
         *(.text*zipparser*)
         *(.text*firmware_update*)
+        *(.text*verify_extracted_firmware*)
+        *(.text*crc32_update*)
+
+        /* Only reached after an SD transfer has already failed */
+        *(.text*diskWriteErrorSense*)
+        *(.text*sdio_log_data_timeout*)
+        *(.text*platform_sd_error_is_medium_defect*)
 
         /* BlueSCSI_disk functions that are only used during init */
         *BlueSCSI_settings.cpp.o(.text .text*)
@@ -174,6 +185,14 @@ SECTIONS
         *(.text*extractFileName*)
         *(.text*setNameFromImage*)
         *(.text*getBlockSize*)
+        *(.text*s2s_floppy*)
+        *(.text*find_floppy_geometry*)
+
+        /* Wi-Fi association, only used during init and reconnect. Keeps the
+         * packet path (platform_network_send/receive) in RAM. */
+        *(.text*platform_network_wifi_join*)
+        *(.text*wifi_security_name*)
+        *(.text*wifi_security_auth*)
 
         /* SCSI commands that don't require high performance */
         *(.text*scsiToolboxCommand*)
@@ -197,6 +216,7 @@ SECTIONS
         *(.text*doReadHeader*)
         *(.text*doPlayAudio*)
         *(.text*audio_play*)
+        *(.text.pio_sm_set_pins)
         *(.text*audio_get_lba_position*)
         *(.text*audio_set_file_position*)
         *(.text*cdromSeekAudio*)

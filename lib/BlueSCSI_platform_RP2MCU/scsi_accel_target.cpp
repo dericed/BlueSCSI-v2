@@ -1,5 +1,6 @@
 /**
  * ZuluSCSI™ - Copyright (c) 2022-2025 Rabbit Hole Computing™
+ * Copyright (c) 2026 Eric Helgeson <eric@bluescsi.com>
  *
  * This work incorporates work from the following
  *  Copyright (c) 2023 joshua stein <jcs@jcs.org>
@@ -55,7 +56,7 @@
 // SM0: Convert data bytes to lookup addresses to add parity
 // SM1: Write data to SCSI bus
 // SM2: For synchronous mode only, count ACK pulses
-#ifdef BLUESCSI_NETWORK
+#if defined(BLUESCSI_NETWORK) || defined(ENABLE_AUDIO_OUTPUT_SPDIF)
 #  define SCSI_DMA_PIO pio0
 #  define SCSI_PARITY_SM 1
 #  define SCSI_DATA_SM 2
@@ -65,7 +66,7 @@
 #  define SCSI_PARITY_SM 0
 #  define SCSI_DATA_SM 1
 #  define SCSI_SYNC_SM 2
-#endif // BLUESCSI_NETWORK
+#endif
 
 
 // SCSI bus write acceleration uses 3 or 4 DMA channels (data flow A->B->C->D):
@@ -946,7 +947,8 @@ static void scsidma_config_gpio()
     else if (g_scsi_dma_state == SCSIDMA_WRITE)
     {
         // Make sure the initial state of all pins is high and output
-        pio_sm_set_pins(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_ACCEL_PINMASK);
+        // Masked: a plain pio_sm_set_pins() writes every pin of the PIO block
+        pio_sm_set_pins_with_mask(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_ACCEL_PINMASK, SCSI_ACCEL_PINMASK);
         pio_sm_set_consecutive_pindirs(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_IO_DB0, 9, true);
         pio_sm_set_consecutive_pindirs(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_OUT_REQ, 1, true);
 
@@ -967,16 +969,14 @@ static void scsidma_config_gpio()
         {
             // Asynchronous read
             // Data bus as input, REQ pin as output
-            pio_sm_set_pins(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_IO_DATA_MASK | (1 << SCSI_OUT_REQ));
-            pio_sm_set_pins(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_ACCEL_PINMASK);
+            pio_sm_set_pins_with_mask(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_ACCEL_PINMASK, SCSI_ACCEL_PINMASK);
             pio_sm_set_consecutive_pindirs(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_IO_DB0, 9, false);
             pio_sm_set_consecutive_pindirs(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_OUT_REQ, 1, true);
         }
         else
         {
             // Synchronous read, REQ pin is written by SYNC_SM
-            pio_sm_set_pins(SCSI_DMA_PIO, SCSI_SYNC_SM, SCSI_IO_DATA_MASK | (1 << SCSI_OUT_REQ));
-            pio_sm_set_pins(SCSI_DMA_PIO, SCSI_SYNC_SM, SCSI_ACCEL_PINMASK);
+            pio_sm_set_pins_with_mask(SCSI_DMA_PIO, SCSI_SYNC_SM, SCSI_ACCEL_PINMASK, SCSI_ACCEL_PINMASK);
             pio_sm_set_consecutive_pindirs(SCSI_DMA_PIO, SCSI_DATA_SM, SCSI_IO_DB0, 9, false);
             pio_sm_set_consecutive_pindirs(SCSI_DMA_PIO, SCSI_SYNC_SM, SCSI_OUT_REQ, 1, true);
         }
@@ -1095,6 +1095,33 @@ void scsi_accel_rp2040_init()
     sm_config_set_sideset_pins(&g_scsi_dma.pio_cfg_sync_write, SCSI_OUT_REQ);
     sm_config_set_out_shift(&g_scsi_dma.pio_cfg_sync_write, true, true, 32);
     sm_config_set_in_shift(&g_scsi_dma.pio_cfg_sync_write, true, true, 1);
+
+    // PIO instruction memory is shared with other subsystems (e.g. CYW43 WiFi
+    // SPI on Pico W). pio_add_program() returns a negative error when the 32
+    // instruction slots run out; unchecked, pio_sm_init() at that bogus offset
+    // makes the SM execute another program's instructions (2026.04 sync-write
+    // regression: zero-ACK hang on synchronous DATA_IN). Fail loudly.
+    {
+        static const struct { const char *name; const uint32_t *offset; } accel_progs[] = {
+            {"parity",           &g_scsi_dma.pio_offset_parity},
+            {"async_write",      &g_scsi_dma.pio_offset_async_write},
+            {"sync_write_pacer", &g_scsi_dma.pio_offset_sync_write_pacer},
+            {"read",             &g_scsi_dma.pio_offset_read},
+            {"sync_read_pacer",  &g_scsi_dma.pio_offset_sync_read_pacer},
+            {"read_parity",      &g_scsi_dma.pio_offset_read_parity},
+            {"sync_write",       &g_scsi_dma.pio_offset_sync_write},
+        };
+        for (size_t i = 0; i < sizeof(accel_progs) / sizeof(accel_progs[0]); i++)
+        {
+            if ((int32_t)*accel_progs[i].offset < 0)
+                logmsg("ERROR: SCSI accel PIO program '", accel_progs[i].name,
+                       "' failed to load, no PIO instruction memory left (",
+                       (int)*accel_progs[i].offset, ")");
+            else
+                dbgmsg("---- SCSI accel PIO program '", accel_progs[i].name,
+                       "' at offset ", (int)*accel_progs[i].offset);
+        }
+    }
 
 
     // Create DMA channel configurations so they can be applied quickly later

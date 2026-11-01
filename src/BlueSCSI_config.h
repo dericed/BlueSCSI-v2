@@ -31,7 +31,7 @@
 #include <BlueSCSI_platform_config.h>
 
 // Use variables for version number
-#define FW_VER_NUM      "2026.04.28"
+#define FW_VER_NUM      "2026.08.18"
 // rel or dev only.
 #define FW_VER_SUFFIX   "dev"
 
@@ -85,7 +85,11 @@
 #define IMAGE_INDEX_MAX 9               // Maximum number of 'IMG0' style statements parsed
 
 // SCSI config
+#if defined(BLUESCSI_ULTRA_WIDE)
+#define NUM_SCSIID  16         // Maximum number of supported SCSI-IDs (The minimum is 0)
+#else
 #define NUM_SCSIID  8          // Maximum number of supported SCSI-IDs (The minimum is 0)
+#endif
 #define NUM_SCSILUN 1          // Maximum number of LUNs supported     (Currently has to be 1)
 
 // SCSI raw fallback configuration when no image files are detected
